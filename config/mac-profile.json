@@ -1,0 +1,17 @@
+{
+  "profile": "mac-workstation",
+  "features": {
+    "code_execution": true,
+    "file_sync": true,
+    "build_tasks": true
+  },
+  "limits": {
+    "max_cpu_percent": 50,
+    "max_memory_mb": 2048,
+    "max_execution_time_sec": 3600
+  },
+  "whitelist": {
+    "commands": ["git", "npm", "node", "cargo", "python3"],
+    "paths": ["~/projects/**", "~/Documents/work/**"]
+  }
+}
