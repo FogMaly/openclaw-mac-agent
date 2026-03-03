@@ -17,8 +17,12 @@ jobs:
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
-          target: aarch64-apple-darwin
           override: true
+      
+      - name: Add targets
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
       
       - name: Build for Apple Silicon (ARM64)
         run: cargo build --release --target aarch64-apple-darwin
