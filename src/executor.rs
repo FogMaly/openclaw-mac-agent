@@ -20,7 +20,7 @@ pub async fn run_command<W>(
     path_whitelist: Arc<Vec<PathBuf>>,
     writer: SharedWriter<W>,
 ) where
-    W: SinkExt<Message> + Unpin,
+    W: SinkExt<Message> + Unpin + Send + 'static,
     W::Error: std::fmt::Display,
 {
     let key = Path::new(&command)
@@ -99,7 +99,7 @@ pub async fn run_command<W>(
 async fn stream_output<R, W>(mut reader: R, id: String, stream: StreamType, writer: SharedWriter<W>)
 where
     R: AsyncRead + Unpin,
-    W: SinkExt<Message> + Unpin,
+    W: SinkExt<Message> + Unpin + Send + 'static,
     W::Error: std::fmt::Display,
 {
     let mut buf = vec![0u8; 4096];
@@ -125,7 +125,7 @@ where
 
 async fn send<W>(writer: &SharedWriter<W>, msg: ClientMessage) -> Result<(), String>
 where
-    W: SinkExt<Message> + Unpin,
+    W: SinkExt<Message> + Unpin + Send + 'static,
     W::Error: std::fmt::Display,
 {
     let encoded = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
