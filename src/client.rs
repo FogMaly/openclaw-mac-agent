@@ -1,13 +1,10 @@
-use std::fs;
-use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Connection, Endpoint, SendStream};
-use rustls::RootCertStore;
+use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::config::Config;
 use crate::executor::{self, SharedWriter};
@@ -30,24 +27,16 @@ pub async fn run_forever(cfg: Config) -> Result<(), String> {
 }
 
 async fn run_once(cfg: Config) -> Result<(), String> {
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse().map_err(err_to_string)?)
-        .map_err(err_to_string)?;
+    let url = format!("ws://{}/agent", cfg.server_addr);
+    
+    let (ws_stream, _) = connect_async(&url)
+        .await
+        .map_err(|e| format!("WebSocket connection failed: {}", e))?;
 
-    let client_cfg = build_client_config(&cfg)?;
-    endpoint.set_default_client_config(client_cfg);
+    let (write, read) = ws_stream.split();
+    let writer: Arc<Mutex<_>> = Arc::new(Mutex::new(write));
 
-    let connecting = endpoint
-        .connect(cfg.server_addr, &cfg.server_name)
-        .map_err(err_to_string)?;
-    let connection = connecting.await.map_err(err_to_string)?;
-
-    handle_connection(connection, cfg).await
-}
-
-async fn handle_connection(connection: Connection, cfg: Config) -> Result<(), String> {
-    let (send, recv) = connection.open_bi().await.map_err(err_to_string)?;
-    let writer: SharedWriter = Arc::new(Mutex::new(send));
-
+    // Send Hello
     send_message(
         &writer,
         ClientMessage::Hello {
@@ -57,6 +46,7 @@ async fn handle_connection(connection: Connection, cfg: Config) -> Result<(), St
     )
     .await?;
 
+    // Heartbeat task
     let heartbeat_writer = writer.clone();
     let heartbeat_secs = cfg.heartbeat_secs.max(3);
     let heartbeat_task = tokio::spawn(async move {
@@ -73,23 +63,31 @@ async fn handle_connection(connection: Connection, cfg: Config) -> Result<(), St
         }
     });
 
+    // Handle incoming messages
     let whitelist = Arc::new(cfg.whitelist.clone());
     let path_whitelist = Arc::new(cfg.path_whitelist.clone());
-    let mut reader = BufReader::new(recv);
-    loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await.map_err(err_to_string)?;
-        if n == 0 {
-            heartbeat_task.abort();
-            return Err("server closed stream".to_string());
-        }
+    
+    let mut read = read;
+    while let Some(msg) = read.next().await {
+        let msg = match msg {
+            Ok(Message::Text(text)) => text,
+            Ok(Message::Close(_)) => {
+                heartbeat_task.abort();
+                return Err("server closed connection".to_string());
+            }
+            Err(e) => {
+                heartbeat_task.abort();
+                return Err(format!("read error: {}", e));
+            }
+            _ => continue,
+        };
 
-        let msg = match serde_json::from_str::<ServerMessage>(line.trim()) {
+        let server_msg = match serde_json::from_str::<ServerMessage>(&msg) {
             Ok(v) => v,
             Err(_) => continue,
         };
 
-        match msg {
+        match server_msg {
             ServerMessage::Exec { id, command, args } => {
                 let writer_cloned = writer.clone();
                 let whitelist_cloned = whitelist.clone();
@@ -112,31 +110,22 @@ async fn handle_connection(connection: Connection, cfg: Config) -> Result<(), St
             }
         }
     }
+
+    heartbeat_task.abort();
+    Ok(())
 }
 
-fn build_client_config(cfg: &Config) -> Result<ClientConfig, String> {
-    let pem = fs::read(&cfg.ca_cert_path).map_err(err_to_string)?;
-    let mut cursor = Cursor::new(pem);
-
-    let mut roots = RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut cursor) {
-        let cert = cert.map_err(err_to_string)?;
-        roots.add(cert).map_err(err_to_string)?;
-    }
-
-    let tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    let quic = QuicClientConfig::try_from(tls).map_err(err_to_string)?;
-    Ok(ClientConfig::new(Arc::new(quic)))
-}
-
-async fn send_message(writer: &Arc<Mutex<SendStream>>, msg: ClientMessage) -> Result<(), String> {
-    let encoded = serde_json::to_vec(&msg).map_err(err_to_string)?;
+async fn send_message<W>(writer: &Arc<Mutex<W>>, msg: ClientMessage) -> Result<(), String>
+where
+    W: SinkExt<Message> + Unpin,
+    W::Error: std::fmt::Display,
+{
+    let encoded = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
     let mut guard = writer.lock().await;
-    guard.write_all(&encoded).await.map_err(err_to_string)?;
-    guard.write_all(b"\n").await.map_err(err_to_string)?;
+    guard
+        .send(Message::Text(encoded))
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -145,8 +134,4 @@ fn now_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs()
-}
-
-fn err_to_string<E: std::fmt::Display>(e: E) -> String {
-    e.to_string()
 }

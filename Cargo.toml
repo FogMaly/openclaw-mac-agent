@@ -4,12 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-tokio = { version = "1.44", default-features = false, features = ["macros", "rt", "time", "io-util", "process", "sync"] }
+tokio = { version = "1.44", default-features = false, features = ["macros", "rt", "time", "io-util", "process", "sync", "net"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 
 [profile.release]
 opt-level = "z"

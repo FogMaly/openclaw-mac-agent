@@ -2,23 +2,27 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use quinn::SendStream;
+use futures_util::SinkExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::protocol::{ClientMessage, StreamType};
 
-pub type SharedWriter = Arc<Mutex<SendStream>>;
+pub type SharedWriter<W> = Arc<Mutex<W>>;
 
-pub async fn run_command(
+pub async fn run_command<W>(
     id: String,
     command: String,
     args: Vec<String>,
     whitelist: Arc<HashSet<String>>,
     path_whitelist: Arc<Vec<PathBuf>>,
-    writer: SharedWriter,
-) {
+    writer: SharedWriter<W>,
+) where
+    W: SinkExt<Message> + Unpin,
+    W::Error: std::fmt::Display,
+{
     let key = Path::new(&command)
         .file_name()
         .and_then(|s| s.to_str())
@@ -29,40 +33,37 @@ pub async fn run_command(
         let _ = send(
             &writer,
             ClientMessage::Error {
-                id,
-                message: format!("command not allowed: {key}"),
+                id: id.clone(),
+                message: format!("command '{}' not in whitelist", command),
             },
         )
         .await;
         return;
     }
 
-    if let Some(bad) = find_disallowed_path(&args, &path_whitelist) {
-        let _ = send(
-            &writer,
-            ClientMessage::Error {
-                id,
-                message: format!("path not allowed: {bad}"),
-            },
-        )
-        .await;
-        return;
+    let cwd = std::env::current_dir().ok();
+    if let Some(ref cwd) = cwd {
+        if !is_path_allowed(cwd, &path_whitelist) {
+            let _ = send(
+                &writer,
+                ClientMessage::Error {
+                    id: id.clone(),
+                    message: format!("cwd '{}' not in path whitelist", cwd.display()),
+                },
+            )
+            .await;
+            return;
+        }
     }
 
-    let mut child = match Command::new(&command)
-        .args(&args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(v) => v,
+    let mut child = match Command::new(&command).args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
+        Ok(c) => c,
         Err(e) => {
             let _ = send(
                 &writer,
                 ClientMessage::Error {
-                    id,
-                    message: format!("spawn failed: {e}"),
+                    id: id.clone(),
+                    message: format!("spawn failed: {}", e),
                 },
             )
             .await;
@@ -73,88 +74,69 @@ pub async fn run_command(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let out_task = tokio::spawn(pump(stdout, id.clone(), StreamType::Stdout, writer.clone()));
-    let err_task = tokio::spawn(pump(stderr, id.clone(), StreamType::Stderr, writer.clone()));
+    let writer_clone = writer.clone();
+    let id_clone = id.clone();
+    if let Some(stdout) = stdout {
+        tokio::spawn(async move {
+            stream_output(stdout, id_clone, StreamType::Stdout, writer_clone).await;
+        });
+    }
+
+    let writer_clone = writer.clone();
+    let id_clone = id.clone();
+    if let Some(stderr) = stderr {
+        tokio::spawn(async move {
+            stream_output(stderr, id_clone, StreamType::Stderr, writer_clone).await;
+        });
+    }
 
     let status = child.wait().await;
-    let _ = out_task.await;
-    let _ = err_task.await;
+    let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
 
-    match status {
-        Ok(s) => {
-            let code = s.code().unwrap_or(-1);
-            let _ = send(&writer, ClientMessage::Exit { id, code }).await;
-        }
-        Err(e) => {
-            let _ = send(
-                &writer,
-                ClientMessage::Error {
-                    id,
-                    message: format!("wait failed: {e}"),
-                },
-            )
-            .await;
-        }
-    }
+    let _ = send(&writer, ClientMessage::Exit { id, code }).await;
 }
 
-fn find_disallowed_path(args: &[String], path_whitelist: &[PathBuf]) -> Option<String> {
-    for arg in args {
-        if !looks_like_path(arg) {
-            continue;
-        }
-
-        let path = PathBuf::from(arg);
-        let candidate = std::fs::canonicalize(&path).unwrap_or(path);
-        let allowed = path_whitelist.iter().any(|root| candidate.starts_with(root));
-
-        if !allowed {
-            return Some(arg.clone());
-        }
-    }
-
-    None
-}
-
-fn looks_like_path(value: &str) -> bool {
-    value.starts_with('/') || value.starts_with("./") || value.starts_with("../") || value.contains('/')
-}
-
-async fn pump<R>(stream: Option<R>, id: String, stream_type: StreamType, writer: SharedWriter)
+async fn stream_output<R, W>(mut reader: R, id: String, stream: StreamType, writer: SharedWriter<W>)
 where
     R: AsyncRead + Unpin,
+    W: SinkExt<Message> + Unpin,
+    W::Error: std::fmt::Display,
 {
-    if let Some(mut s) = stream {
-        let mut buf = [0_u8; 1024];
-        loop {
-            match s.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                    if send(
-                        &writer,
-                        ClientMessage::Output {
-                            id: id.clone(),
-                            stream: stream_type,
-                            chunk,
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break,
+    let mut buf = vec![0u8; 4096];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = send(
+                    &writer,
+                    ClientMessage::Output {
+                        id: id.clone(),
+                        stream,
+                        chunk,
+                    },
+                )
+                .await;
             }
+            Err(_) => break,
         }
     }
 }
 
-async fn send(writer: &SharedWriter, msg: ClientMessage) -> Result<(), ()> {
-    let encoded = serde_json::to_vec(&msg).map_err(|_| ())?;
+async fn send<W>(writer: &SharedWriter<W>, msg: ClientMessage) -> Result<(), String>
+where
+    W: SinkExt<Message> + Unpin,
+    W::Error: std::fmt::Display,
+{
+    let encoded = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
     let mut guard = writer.lock().await;
-    guard.write_all(&encoded).await.map_err(|_| ())?;
-    guard.write_all(b"\n").await.map_err(|_| ())?;
+    guard
+        .send(Message::Text(encoded))
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn is_path_allowed(path: &Path, whitelist: &[PathBuf]) -> bool {
+    whitelist.iter().any(|allowed| path.starts_with(allowed))
 }
